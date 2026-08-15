@@ -1,0 +1,21 @@
+# dsh-auto-approval plugin configuration example.
+#
+# Place this in your cordis.yml under plugins:
+
+# plugins:
+#   auto-approval:
+#     $local: ./path/to/dsh-auto-approval
+#     config:
+#       baseUrl: http://127.0.0.1:1234/v1
+#       modelName: gemma-4-e4b-it-mlx
+#       confidenceThreshold: 0.7
+#       patternFile: /home/you/.dsh/auto-approval-patterns.json
+#       allowedPatterns:
+#         - "/home/you/projects/**"
+#       deniedPatterns:
+#         - "**/.ssh/**"
+#         - "**/etc/shadow"
+#         - "**/etc/passwd"
+#         - "**/.gitconfig"
+#         - "**/.aws/**"
+#         - "**/.kube/**"

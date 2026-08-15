@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build output
+lib/
+
+# Package manager
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# TypeScript
+*.tsbuildinfo
