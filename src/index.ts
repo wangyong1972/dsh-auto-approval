@@ -1,4 +1,5 @@
 import { Context } from '@deepseek-ai/cordis';
+import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands';
 import z from '@deepseek-ai/schemastery';
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
@@ -6,6 +7,8 @@ import { DEFAULTS, type Config as PluginConfig, type ToolCallEvent } from './typ
 import { quickCheck } from './quick-check.ts';
 import { judge } from './judge.ts';
 import { loadPatterns, savePatterns, matchPatterns, learnPattern } from './patterns.ts';
+import { compileDangerPatterns, findDangerMatch } from './danger-patterns.ts';
+import { loadState, resolveStateFile, saveState, type ApprovalState } from './state.ts';
 
 export const name = 'auto-approval';
 
@@ -25,6 +28,12 @@ export const Config: z<PluginConfig> = z.object({
   confidenceThreshold: z.number().default(DEFAULTS.confidenceThreshold),
   // Path to the learned-patterns file. Omit to disable learning.
   patternFile: z.string().default(''),
+  // Danger-command regexes. null keeps the built-in list.
+  dangerPatterns: z.union([z.array(z.string()), z.const(null)]).default(null),
+  extraDangerPatterns: z.array(z.string()).default([]),
+  timeoutMs: z.number().min(1).default(DEFAULTS.timeoutMs),
+  // On/off switch file toggled by `/autoapprove on|off` (runtime, no restart).
+  stateFile: z.string().default(''),
 });
 
 export function apply(ctx: Context, config: PluginConfig): void {
@@ -35,6 +44,18 @@ export function apply(ctx: Context, config: PluginConfig): void {
   const allowed = config.allowedPatterns!;
   const denied = config.deniedPatterns!;
   const patternFile = config.patternFile!;
+  const timeoutMs = config.timeoutMs!;
+
+  // Deterministic danger rules compiled once; a match always defers to human.
+  const dangerRules = compileDangerPatterns(config.dangerPatterns ?? null, config.extraDangerPatterns ?? []);
+
+  // Runtime on/off switch (`/autoapprove on|off`). When off, every request
+  // passes straight through to the normal human approval flow — the plugin is
+  // inert, exactly as if it were not loaded. Persisted across restarts.
+  const stateFile = resolveStateFile(
+    config.stateFile ? { stateFile: config.stateFile, patternFile } : { patternFile },
+  );
+  const state: ApprovalState = loadState(stateFile);
 
   // Learned allowances (human-approved operations), keyed by tool name.
   const patterns = loadPatterns(patternFile);
@@ -63,6 +84,11 @@ export function apply(ctx: Context, config: PluginConfig): void {
   ctx.on(
     'approval/request',
     async (req: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => {
+      // Switch is off: route every request to the human approval flow.
+      if (!state.enabled) {
+        return next();
+      }
+
       // Only intercept tool-related approvals
       if (!req.toolName) {
         return next();
@@ -88,8 +114,22 @@ export function apply(ctx: Context, config: PluginConfig): void {
       // or "/etc/" and would falsely trigger the deny-list).
       const target = extractTarget(req.toolName, toolArgs) ?? req.reason ?? req.toolName;
 
-      // 0. Learned patterns win first: the human already approved this kind
-      //    of operation, so approve without prompting or judging.
+      // 0. Deterministic danger-command check on the raw tool arguments.
+      //    A match defers to the human; the classifier AND learned patterns
+      //    can never override it — a one-time approval of a destructive
+      //    command must not become a permanent exemption.
+      const danger = findDangerMatch(`${req.reason ?? ''}\n${toolArgs ?? ''}`, dangerRules);
+      if (danger !== undefined) {
+        console.log(`[auto-approval] danger pattern matched: ${danger.source}`);
+        const approvalId = pendingApprovalId(session, req.callId);
+        if (approvalId && patternFile) {
+          deferred.set(approvalId, { toolName: req.toolName, target });
+        }
+        return next();
+      }
+
+      // 1. Learned patterns: the human already approved this kind of
+      //    operation, so approve without prompting or judging.
       if (patternFile) {
         const learned = matchPatterns(patterns, req.toolName, target);
         if (learned) {
@@ -97,7 +137,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
         }
       }
 
-      // 1. Quick-path check (glob matching — no LLM call)
+      // 2. Quick-path check (glob matching — no LLM call)
       const quick = quickCheck(req.toolName, target, workspaceRoot, allowed, denied);
       if (quick === 'deny' || quick === 'allow') {
         if (quick === 'allow') {
@@ -112,7 +152,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
         return next();
       }
 
-      // 2. LLM judge via LM Studio
+      // 3. LLM judge via LM Studio (strict two-value verdict, timeout-guarded)
       const verdict = await judge(
         req.toolName,
         toolArgs,
@@ -120,14 +160,15 @@ export function apply(ctx: Context, config: PluginConfig): void {
         baseUrl,
         modelName,
         req.signal,
+        timeoutMs,
       );
 
-      if (verdict && verdict.safe && verdict.confidence >= threshold) {
+      if (verdict !== undefined && verdict.verdict === 'approve') {
         return 'allowed-once' as ApprovalOutcome;
       }
 
-      // 3. Unsure, unsafe, or judge unavailable → delegate to human. If they
-      //    approve, the decided-event handler learns the target.
+      // 4. Anything else (ask, timeout, malformed, error) → delegate to human.
+      //    If they approve, the decided-event handler learns the target.
       const approvalId = pendingApprovalId(session, req.callId);
       if (approvalId && patternFile) {
         deferred.set(approvalId, { toolName: req.toolName, target });
@@ -140,9 +181,59 @@ export function apply(ctx: Context, config: PluginConfig): void {
     { prepend: true },
   );
 
-  console.log(
-    `[auto-approval] Active (model=${modelName}, threshold=${threshold}${patternFile ? `, patterns=${patternFile}` : ''})`,
+  // Runtime `/autoapprove on|off|status` command. Registered through an
+  // injected child so the approval responder never depends on the commands
+  // service being loaded; the register disposer unregisters on teardown.
+  ctx.inject(['commands'], (commandCtx) =>
+    commandCtx.commands.register({
+      name: 'autoapprove',
+      description: 'Turn auto-approval on or off at runtime (no restart)',
+      input: { hint: 'on | off | status' },
+      handler: (invocation: CommandInvocation): CommandResult =>
+        executeAutoapproveCommand(invocation, state, stateFile),
+    }),
   );
+
+  console.log(
+    `[auto-approval] Active (state=${state.enabled ? 'on' : 'off'}, model=${modelName}, threshold=${threshold}${patternFile ? `, patterns=${patternFile}` : ''}, danger=${dangerRules.length} rules, stateFile=${stateFile})`,
+  );
+}
+
+/**
+ * Handler for `/autoapprove on|off|status`. Flips the runtime switch,
+ * persists it, and reports the new state. Unknown input reports status
+ * with usage rather than failing.
+ */
+function executeAutoapproveCommand(
+  invocation: CommandInvocation,
+  state: ApprovalState,
+  stateFile: string,
+): CommandResult {
+  const arg = invocation.rawInput.trim().toLowerCase();
+  const statusText = `auto-approval is currently ${state.enabled ? 'ON' : 'OFF'}`;
+
+  if (arg === 'on' || arg === 'enable') {
+    state.enabled = true;
+    saveState(stateFile, state);
+    return {
+      kind: 'success',
+      text: 'auto-approval is now ON — safe permission requests are auto-approved by the local judge. (persisted, no restart needed)',
+    };
+  }
+  if (arg === 'off' || arg === 'disable') {
+    state.enabled = false;
+    saveState(stateFile, state);
+    return {
+      kind: 'success',
+      text: 'auto-approval is now OFF — every permission request goes to the human approval UI. (persisted, no restart needed)',
+    };
+  }
+
+  // No argument or unknown input: report status and usage.
+  return {
+    kind: 'success',
+    text: `${statusText}. Usage: /autoapprove on|off|status`,
+  };
 }
 
 /**

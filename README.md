@@ -11,30 +11,36 @@ Permission request (sandbox escalation, tool approval)
         │
         ▼
 ┌───────────────────────────────────────────────┐
-│ 0. Learned patterns (you approved before)     │
+│ 0. Danger patterns (destructive commands)     │
+│    match → always defer to human (never       │
+│    overridden by learning or the LLM)         │
+└───────────────────────────────────────────────┘
+        │ no match
+        ▼
+┌───────────────────────────────────────────────┐
+│ 1. Learned patterns (you approved before)     │
 │    match → allowed-once (no LLM, ~6ms)        │
 └───────────────────────────────────────────────┘
         │ no match
         ▼
 ┌───────────────────────────────────────────────┐
-│ 1. Quick-path allow-list (glob match)         │
+│ 2. Quick-path allow-list (glob match)         │
 │    session workspace root + allowedPatterns   │
 │    match → allowed-once (no LLM call)         │
 └───────────────────────────────────────────────┘
         │ no match
         ▼
 ┌───────────────────────────────────────────────┐
-│ 2. Local LLM judge (LM Studio)                │
-│    few-shot SAFE / NOT_SAFE classify          │
-│    safe + confidence ≥ threshold              │
-│      → allowed-once                           │
-│    otherwise (unsafe / unsure / error)        │
+│ 3. Local LLM judge (LM Studio)                │
+│    strict two-value verdict (approve|ask)     │
+│    approve → allowed-once                     │
+│    ask / timeout / malformed / error          │
 │      → defer to human prompt                  │
 └───────────────────────────────────────────────┘
         │
         ▼
 ┌───────────────────────────────────────────────┐
-│ 3. Human decides                              │
+│ 4. Human decides                              │
 │    approve → operation runs AND the target    │
 │              is learned into the pattern file │
 │              (future matches auto-approve)    │
@@ -49,7 +55,9 @@ Key behaviors:
 - **Learning is opt-in.** Set `patternFile` to enable it. Every operation you approve after the plugin deferred is remembered; a future identical or pattern-matching operation is auto-approved without prompting or an LLM call.
 - **Only human approvals are learned.** Operations the plugin auto-approved (allow-list or LLM-safe) are not learned — there is nothing to learn, and the pattern file only grows from your explicit decisions.
 - **Safe by default on errors.** If LM Studio is unreachable or returns a malformed response, the request is deferred to the human prompt.
+- **Danger patterns always defer to the human.** A deterministic regex list (built-in + `extraDangerPatterns`) is checked *before* learned patterns, so a one-time approval of a destructive command (e.g. `rm -rf /`, `dd`, `git push --force`) can never become a permanent exemption.
 - **No restart needed for config changes** — the profile patch is watched by DSH's HMR. Restart is only required after *code* changes to the plugin itself.
+- **Toggle at runtime with `/autoapprove on|off|status`** — no restart, no YAML editing. See [Runtime on/off](#runtime-onoff).
 
 ## Prerequisites
 
@@ -101,7 +109,7 @@ npx @deepseek-ai/dsh web --host 127.0.0.1 --port 3080
 You should see:
 
 ```
-[auto-approval] Active (model=gemma-4-e4b-it-mlx, threshold=0.7, workspace=/Users/you, patterns=/Users/you/.dsh/auto-approval-patterns.json)
+[auto-approval] Active (state=on, model=gemma-4-e4b-it-mlx, threshold=0.7, patterns=/Users/you/.dsh/auto-approval-patterns.json, danger=13 rules, stateFile=/Users/you/.dsh/auto-approval-state.json)
 ```
 
 When a human approves a deferred operation, the terminal logs:
@@ -122,6 +130,10 @@ All options are optional; defaults are shown.
 | `deniedPatterns` | `string[]` | see below | Glob patterns that skip the LLM and go straight to the human prompt |
 | `confidenceThreshold` | `number` | `0.7` | Minimum LLM confidence to auto-approve a `SAFE` verdict |
 | `patternFile` | `string` | `''` (disabled) | Path to the learned-patterns JSON file. Enables learning. |
+| `stateFile` | `string` | derived (see below) | Path to the on/off switch file toggled by `/autoapprove`. Defaults to `auto-approval-state.json` next to `patternFile`, or `~/.dsh/auto-approval-state.json` when no pattern file is set. |
+| `dangerPatterns` | `string[] \| null` | `null` (built-in list) | Case-insensitive regex sources that **replace** the built-in danger list |
+| `extraDangerPatterns` | `string[]` | `[]` | Case-insensitive regex sources **appended** to the built-in danger list |
+| `timeoutMs` | `number` | `8000` | End-to-end LLM classification deadline; a timeout defers to the human |
 
 Default `deniedPatterns`:
 
@@ -154,6 +166,24 @@ Default `deniedPatterns`:
 ```
 
 > Patch semantics: the `config` block **replaces** the whole plugin config, so list every option you want (defaults do not merge with your patch — they only apply when the field is omitted at the schema level, and a patch replaces the row's entire config).
+
+## Runtime on/off
+
+Toggle auto-approval at runtime from the chat UI — **no restart, no YAML editing**:
+
+```
+/autoapprove on       # auto-approve safe requests again
+/autoapprove off      # every request goes to the human approval UI
+/autoapprove status   # show the current state
+```
+
+How it works:
+
+- When **off**, the plugin is inert: every `approval/request` passes straight through to the built-in human approval flow — exactly as if the plugin were not loaded. Nothing is learned while off.
+- The switch is **persisted** to `stateFile` (default: `auto-approval-state.json` next to the pattern file, or `~/.dsh/auto-approval-state.json`), so a DSH restart does not silently re-enable auto-approval after you turned it off.
+- The toggle is a plugin-internal switch, **not** an edit of `cordis.patch.yml`: it needs no config reload and cannot break the profile with a YAML mistake.
+
+> Why not just comment out the plugin block in `cordis.patch.yml`? The patch watcher would technically pick that up (it recomposes the whole entry tree), but it is fragile: one YAML typo or a mid-session reload can disturb other plugins, and re-enabling requires re-adding the exact block. The command achieves the same "plugin inert" semantics instantly and safely.
 
 ## Learned patterns file
 
@@ -209,10 +239,12 @@ Source layout:
 
 ```
 src/
-├── index.ts        # Plugin entry: Config schema, apply(), approval/request listener, learning
-├── judge.ts        # LM Studio call + few-shot prompt + SAFE/NOT_SAFE parser
+├── index.ts        # Plugin entry: Config schema, apply(), approval/request listener, learning, /autoapprove command
+├── judge.ts        # LM Studio call + few-shot prompt + strict two-value verdict parser
 ├── quick-check.ts  # Deny/allow glob fast-path (no LLM call)
 ├── patterns.ts     # Learned-pattern persistence + matching
+├── state.ts        # Runtime on/off switch persistence (/autoapprove)
+├── danger-patterns.ts  # Built-in danger-command regexes + compile/match
 └── types.ts        # Config / JudgeVerdict / ToolCallEvent types + DEFAULTS
 ```
 

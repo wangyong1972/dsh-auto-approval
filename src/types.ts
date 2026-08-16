@@ -47,16 +47,43 @@ export interface Config {
    * disable learning.
    */
   patternFile?: string;
+
+  /**
+   * Case-insensitive regex sources appended to the built-in danger list.
+   * @default []
+   */
+  extraDangerPatterns?: string[];
+
+  /**
+   * Case-insensitive regex sources that REPLACE the built-in danger list.
+   * `null` (default) keeps the built-in list.
+   * @default null
+   */
+  dangerPatterns?: string[] | null;
+
+  /**
+   * End-to-end classification deadline in milliseconds. A timeout defers to
+   * the human.
+   * @default 8000
+   */
+  timeoutMs?: number;
+
+  /**
+   * Path to the on/off switch file toggled by `/autoapprove on|off`.
+   * Empty (default) derives it next to `patternFile`, falling back to
+   * `~/.dsh/auto-approval-state.json`. The switch survives restarts.
+   * @default ''
+   */
+  stateFile?: string;
 }
 
 /**
- * The structured response we ask the local LLM to produce.
+ * The strict classifier verdict. Only `approve` may auto-approve; every other
+ * result (including `ask` and any parse failure) defers to the human.
  */
 export interface JudgeVerdict {
-  /** Whether the operation is considered safe. */
-  safe: boolean;
-  /** Confidence in the judgement, 0.0–1.0. */
-  confidence: number;
+  /** The strict two-value classification. */
+  verdict: 'approve' | 'ask';
 }
 
 /**
@@ -75,4 +102,5 @@ export const DEFAULTS = {
   baseUrl: 'http://127.0.0.1:1234/v1',
   modelName: 'gemma-4-e4b-it-mlx',
   confidenceThreshold: 0.7,
+  timeoutMs: 8000,
 } as const;
