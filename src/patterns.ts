@@ -58,6 +58,20 @@ export function savePatterns(file: string, data: PatternFile): void {
 /**
  * Check whether a target matches any learned pattern for the tool.
  * @returns the matching pattern, or undefined.
+ *
+ * bash matching is two-staged:
+ * - **Fuzzy stage (all entries)**: skeleton equality — both sides are
+ *   normalized (quoted content becomes `**`) and must be *string-equal*.
+ *   Only quoted wording may differ (e.g. `echo "写入成功"` vs
+ *   `echo "写入完成"`); structural differences (extra commands, different
+ *   paths, different quote counts) never match. This covers both skeleton
+ *   entries and legacy verbatim entries.
+ * - **Legacy glob stage (entries without `**` only)**: literal glob match
+ *   of the raw target, so real `*`/`?` wildcards learned from commands
+ *   still work. Skeleton entries (`**` placeholder) deliberately skip glob
+ *   matching: an anchored glob would let a trailing `**` swallow appended
+ *   command segments (`... || echo "x" && ls`), which fuzzy equality
+ *   correctly rejects.
  */
 export function matchPatterns(
   patterns: PatternFile,
@@ -65,6 +79,14 @@ export function matchPatterns(
   target: string,
 ): LearnedPattern | undefined {
   const list = patterns[toolName] ?? [];
+  if (toolName === 'bash') {
+    const skeleton = normalizeCommand(target);
+    for (const learned of list) {
+      if (normalizeCommand(learned.pattern) === skeleton) return learned;
+      if (!learned.pattern.includes('**') && matchGlob(target, learned.pattern)) return learned;
+    }
+    return undefined;
+  }
   for (const learned of list) {
     if (matchGlob(target, learned.pattern)) return learned;
   }
@@ -74,21 +96,33 @@ export function matchPatterns(
 /**
  * Learn a new allowance for a target: either bump an existing pattern or
  * append one. Returns the updated pattern file (caller persists it).
+ *
+ * bash commands are stored as a normalized **skeleton**: the content of
+ * every quoted token (`"..."` / `'...'`) is replaced with `**`, so future
+ * requests that differ only in quoted wording match the same learned
+ * pattern. Other tools (file paths) are stored verbatim — fuzzy path
+ * matching is deliberately not applied.
  */
 export function learnPattern(
   patterns: PatternFile,
   toolName: string,
   target: string,
 ): PatternFile {
+  const pattern = toolName === 'bash' ? normalizeCommand(target) : target;
   const list = patterns[toolName] ?? [];
-  // Exact-match bump first.
-  const existing = list.find((learned) => learned.pattern === target);
+  // Bump an existing entry whose normalized form equals the new pattern
+  // (bash: also matches entries learned verbatim before fuzzy learning).
+  const existing = list.find((learned) =>
+    toolName === 'bash'
+      ? normalizeCommand(learned.pattern) === pattern
+      : learned.pattern === pattern,
+  );
   if (existing) {
     existing.count += 1;
     existing.lastApprovedAt = new Date().toISOString();
   } else {
     list.push({
-      pattern: target,
+      pattern,
       count: 1,
       lastApprovedAt: new Date().toISOString(),
     });
@@ -96,6 +130,21 @@ export function learnPattern(
   // Cap the list so a long session cannot grow it unbounded.
   patterns[toolName] = list.slice(-50);
   return patterns;
+}
+
+/**
+ * Normalize a bash command into a skeleton for fuzzy matching: the content
+ * of every quoted token (`"..."` / `'...'`) is replaced with `**` (a
+ * cross-segment glob wildcard). Unquoted text, command substitutions
+ * (`$()`), and backticks are left verbatim — those are never generalized
+ * because they can carry executable content.
+ *
+ * Examples:
+ *   `echo "写入成功" > /a/b.txt`  →  `echo ** > /a/b.txt`
+ *   `cd '/a b/c' && pnpm build`   →  `cd ** && pnpm build`
+ */
+export function normalizeCommand(text: string): string {
+  return text.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '**');
 }
 
 /**
@@ -114,7 +163,12 @@ export function matchGlob(target: string, pattern: string): boolean {
     const ch = p[i]!;
     if (ch === '*') {
       if (p[i + 1] === '*') {
-        parts.push('.*');
+        // Non-greedy: `**` matches as little as possible. With the
+        // `^...$` anchor the overall match result is unchanged for path
+        // globs, but a trailing `**` no longer swallows appended command
+        // segments (e.g. a learned `... || echo **` must not match
+        // `... || echo "x" && ls`).
+        parts.push('.*?');
         i += 2;
         if (p[i] === '/') i++;
       } else {

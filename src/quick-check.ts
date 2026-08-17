@@ -65,7 +65,10 @@ function matchGlob(target: string, pattern: string): boolean {
     const ch = p[i]!;
     if (ch === '*') {
       if (p[i + 1] === '*') {
-        parts.push('.*');
+        // Non-greedy (see patterns.ts): identical overall result for
+        // anchored path globs, but a trailing `**` no longer swallows
+        // appended text.
+        parts.push('.*?');
         i += 2;
         if (p[i] === '/') i++;
       } else {
