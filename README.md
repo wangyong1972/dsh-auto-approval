@@ -131,6 +131,7 @@ All options are optional; defaults are shown.
 | `confidenceThreshold` | `number` | `0.7` | Minimum LLM confidence to auto-approve a `SAFE` verdict |
 | `patternFile` | `string` | `''` (disabled) | Path to the learned-patterns JSON file. Enables learning. |
 | `stateFile` | `string` | derived (see below) | Path to the on/off switch file toggled by `/autoapprove`. Defaults to `auto-approval-state.json` next to `patternFile`, or `~/.dsh/auto-approval-state.json` when no pattern file is set. |
+| `auditFile` | `string` | `~/.dsh/auto-approval-audit.jsonl` | Path to the audit trail (every auto-approval, with basis). Empty derives the default. |
 | `dangerPatterns` | `string[] \| null` | `null` (built-in list) | Case-insensitive regex sources that **replace** the built-in danger list |
 | `extraDangerPatterns` | `string[]` | `[]` | Case-insensitive regex sources **appended** to the built-in danger list |
 | `timeoutMs` | `number` | `8000` | End-to-end LLM classification deadline; a timeout defers to the human |
@@ -175,6 +176,7 @@ Toggle auto-approval at runtime from the chat UI — **no restart, no YAML editi
 /autoapprove on       # auto-approve safe requests again
 /autoapprove off      # every request goes to the human approval UI
 /autoapprove status   # show the current state
+/autoapprove stats    # audit roll-up: how many manual approvals were saved
 ```
 
 How it works:
@@ -184,6 +186,27 @@ How it works:
 - The toggle is a plugin-internal switch, **not** an edit of `cordis.patch.yml`: it needs no config reload and cannot break the profile with a YAML mistake.
 
 > Why not just comment out the plugin block in `cordis.patch.yml`? The patch watcher would technically pick that up (it recomposes the whole entry tree), but it is fragile: one YAML typo or a mid-session reload can disturb other plugins, and re-enabling requires re-adding the exact block. The command achieves the same "plugin inert" semantics instantly and safely.
+
+## Audit trail
+
+Every request the plugin **auto-approves** is appended as one JSON line to the audit file (`~/.dsh/auto-approval-audit.jsonl` by default, override with `auditFile`), recording the timestamp, tool, extracted target, and the **basis** for the decision:
+
+| basis | Meaning |
+|-------|---------|
+| `learned` | Matched a pattern you approved before (no LLM call) |
+| `allow` | Matched the allow-list (session workspace / `allowedPatterns`) |
+| `judge` | The local LLM classified it `approve` (latency recorded) |
+
+Deferred requests (danger match, deny-list, judge `ask`) are **not** recorded — those are the ones that still reach you. The file is trimmed at ~1 MB (keeps the newest 2000 lines). `/autoapprove stats` reads it and shows:
+
+```
+auto-approval: ON — audit total=42, today=7
+  basis: learned=30  allow=8  judge=4
+  latest:
+    12:03:04 bash learned: echo ** > /Users/you/Desktop/fix.txt ...
+```
+
+The authoritative audit remains DSH's own `approval/asked` + `approval/decided` session events; this file is a convenience roll-up of what the plugin saved you from reviewing.
 
 ## Learned patterns file
 
@@ -201,11 +224,16 @@ When `patternFile` is set, the plugin maintains a JSON file like:
 }
 ```
 
-- `pattern` is the **exact extracted target** (the bash command, or the `file_path` for fs tools) that you approved.
+- `pattern` is the learned target for the operation you approved.
+- **bash patterns are stored as a normalized *skeleton*.** The content of every quoted token (`"..."` / `'...'`) is replaced with `**`, so future requests that differ only in quoted wording match the same learned pattern — e.g. approving `echo "写入成功" > /path` also covers `echo "写入完成" > /path`. Matching is *strict*: the two skeletons must be string-equal, so structural differences (extra commands, different paths, different numbers of quotes) never match, and a trailing placeholder cannot swallow appended command segments (`... || echo "x" && ls` does **not** match a pattern ending in `... || echo **`). Quoted content is the only thing that may vary.
+- **Command substitutions and backticks are never generalized.** `$()` and `` ` `` content is left verbatim, because it can carry executable content.
+- **fs tools (edit/write) are stored verbatim** as exact file paths; fuzzy path matching is deliberately not applied.
+- For entries learned before this feature (verbatim text), the same fuzzy matching applies via skeleton equality, so old patterns immediately match new wording too. Entries whose pattern contains a real `*`/`?` wildcard (no `**`) still match with glob semantics.
+- The danger-pattern check runs **before** learned patterns, so a learned skeleton can never auto-approve a destructive command.
 - `count` increments each time you approve a new occurrence of that pattern; auto-approvals via a learned pattern do **not** increment it.
 - The list is capped at 50 entries per tool; the newest approvals win.
 - You can edit or delete this file at any time — the plugin reloads it on the next request and on restart.
-- **Matching is literal except `*` and `?`.** The pattern is treated as a glob: `*` matches within one path segment, `**` crosses directories, `?` matches one character. All other characters (including shell metacharacters like `|`, `&`, quotes, parentheses) match **literally** — they are escaped before regex compilation, so a pattern containing `||` never becomes a regex alternation and cannot match unrelated commands. A learned bash command only auto-approves a request whose extracted command is textually identical (up to glob wildcards).
+- Glob details: `*` matches within one path segment, `**` crosses segments, `?` matches one character; all other characters (including shell metacharacters like `|`, `&`, quotes, parentheses) match **literally** — they are escaped before regex compilation, so a pattern containing `||` never becomes a regex alternation and cannot match unrelated commands.
 
 ## Workspace root
 

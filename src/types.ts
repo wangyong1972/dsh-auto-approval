@@ -75,6 +75,15 @@ export interface Config {
    * @default ''
    */
   stateFile?: string;
+
+  /**
+   * Path to the audit trail file. Every auto-approval is appended as one
+   * JSON line (what was approved, on what basis, classifier latency).
+   * Empty (default) resolves to `~/.dsh/auto-approval-audit.jsonl`.
+   * View roll-ups with `/autoapprove stats`.
+   * @default ''
+   */
+  auditFile?: string;
 }
 
 /**

@@ -9,6 +9,13 @@ import { judge } from './judge.ts';
 import { loadPatterns, savePatterns, matchPatterns, learnPattern } from './patterns.ts';
 import { compileDangerPatterns, findDangerMatch } from './danger-patterns.ts';
 import { loadState, resolveStateFile, saveState, type ApprovalState } from './state.ts';
+import {
+  readAudit,
+  recordAudit,
+  renderStats,
+  resolveAuditFile,
+  summarizeAudit,
+} from './audit.ts';
 
 export const name = 'auto-approval';
 
@@ -34,6 +41,8 @@ export const Config: z<PluginConfig> = z.object({
   timeoutMs: z.number().min(1).default(DEFAULTS.timeoutMs),
   // On/off switch file toggled by `/autoapprove on|off` (runtime, no restart).
   stateFile: z.string().default(''),
+  // Audit trail: every auto-approval is appended here (what + basis).
+  auditFile: z.string().default(''),
 });
 
 export function apply(ctx: Context, config: PluginConfig): void {
@@ -56,6 +65,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
     config.stateFile ? { stateFile: config.stateFile, patternFile } : { patternFile },
   );
   const state: ApprovalState = loadState(stateFile);
+
+  // Audit trail of auto-approvals (`/autoapprove stats` reads this).
+  const auditFile = resolveAuditFile(config.auditFile);
 
   // Learned allowances (human-approved operations), keyed by tool name.
   const patterns = loadPatterns(patternFile);
@@ -133,6 +145,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       if (patternFile) {
         const learned = matchPatterns(patterns, req.toolName, target);
         if (learned) {
+          recordAudit(auditFile, { time: new Date().toISOString(), tool: req.toolName, target, basis: 'learned' });
           return 'allowed-once' as ApprovalOutcome;
         }
       }
@@ -141,6 +154,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       const quick = quickCheck(req.toolName, target, workspaceRoot, allowed, denied);
       if (quick === 'deny' || quick === 'allow') {
         if (quick === 'allow') {
+          recordAudit(auditFile, { time: new Date().toISOString(), tool: req.toolName, target, basis: 'allow' });
           return 'allowed-once' as ApprovalOutcome;
         }
         // Deny-list hit: do NOT silently reject — defer to the human so they
@@ -153,6 +167,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       }
 
       // 3. LLM judge via LM Studio (strict two-value verdict, timeout-guarded)
+      const judgeStart = Date.now();
       const verdict = await judge(
         req.toolName,
         toolArgs,
@@ -162,8 +177,16 @@ export function apply(ctx: Context, config: PluginConfig): void {
         req.signal,
         timeoutMs,
       );
+      const judgeLatencyMs = Date.now() - judgeStart;
 
       if (verdict !== undefined && verdict.verdict === 'approve') {
+        recordAudit(auditFile, {
+          time: new Date().toISOString(),
+          tool: req.toolName,
+          target,
+          basis: 'judge',
+          latencyMs: judgeLatencyMs,
+        });
         return 'allowed-once' as ApprovalOutcome;
       }
 
@@ -187,27 +210,28 @@ export function apply(ctx: Context, config: PluginConfig): void {
   ctx.inject(['commands'], (commandCtx) =>
     commandCtx.commands.register({
       name: 'autoapprove',
-      description: 'Turn auto-approval on or off at runtime (no restart)',
-      input: { hint: 'on | off | status' },
+      description: 'Turn auto-approval on or off, or show audit stats, at runtime',
+      input: { hint: 'on | off | status | stats' },
       handler: (invocation: CommandInvocation): CommandResult =>
-        executeAutoapproveCommand(invocation, state, stateFile),
+        executeAutoapproveCommand(invocation, state, stateFile, auditFile),
     }),
   );
 
   console.log(
-    `[auto-approval] Active (state=${state.enabled ? 'on' : 'off'}, model=${modelName}, threshold=${threshold}${patternFile ? `, patterns=${patternFile}` : ''}, danger=${dangerRules.length} rules, stateFile=${stateFile})`,
+    `[auto-approval] Active (state=${state.enabled ? 'on' : 'off'}, model=${modelName}, threshold=${threshold}${patternFile ? `, patterns=${patternFile}` : ''}, danger=${dangerRules.length} rules, stateFile=${stateFile}, auditFile=${auditFile})`,
   );
 }
 
 /**
- * Handler for `/autoapprove on|off|status`. Flips the runtime switch,
- * persists it, and reports the new state. Unknown input reports status
+ * Handler for `/autoapprove on|off|status|stats`. Flips the runtime switch,
+ * persists it, or renders the audit roll-up. Unknown input reports status
  * with usage rather than failing.
  */
 function executeAutoapproveCommand(
   invocation: CommandInvocation,
   state: ApprovalState,
   stateFile: string,
+  auditFile: string,
 ): CommandResult {
   const arg = invocation.rawInput.trim().toLowerCase();
   const statusText = `auto-approval is currently ${state.enabled ? 'ON' : 'OFF'}`;
@@ -228,11 +252,18 @@ function executeAutoapproveCommand(
       text: 'auto-approval is now OFF — every permission request goes to the human approval UI. (persisted, no restart needed)',
     };
   }
+  if (arg === 'stats' || arg === 'log' || arg === 'audit') {
+    const stats = summarizeAudit(readAudit(auditFile));
+    return {
+      kind: 'success',
+      text: renderStats(stats, state.enabled),
+    };
+  }
 
   // No argument or unknown input: report status and usage.
   return {
     kind: 'success',
-    text: `${statusText}. Usage: /autoapprove on|off|status`,
+    text: `${statusText}. Usage: /autoapprove on|off|status|stats`,
   };
 }
 
